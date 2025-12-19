@@ -616,9 +616,7 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
             minute=body.natal_minute,
             second=body.natal_second,
         )
-        tz_offset_minutes = _tz_offset_for(
-            natal_dt, body.timezone, body.tz_offset_minutes, strict=body.strict_timezone
-        )
+        tz_offset_minutes = _tz_offset_for(natal_dt, body.timezone, body.tz_offset_minutes)
 
         cache_key = f"transits:{auth['user_id']}:{body.target_date}"
         cached = cache.get(cache_key)
@@ -743,9 +741,7 @@ async def render_data(body: RenderDataRequest, request: Request, auth=Depends(ge
         minute=body.minute,
         second=body.second,
     )
-    tz_offset_minutes = _tz_offset_for(
-        dt, body.timezone, body.tz_offset_minutes, strict=body.strict_timezone
-    )
+    tz_offset_minutes = _tz_offset_for(dt, body.timezone, body.tz_offset_minutes)
 
     cache_key = f"render:{auth['user_id']}:{hash(body.model_dump_json())}"
     cached = cache.get(cache_key)

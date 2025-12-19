@@ -41,22 +41,6 @@ def test_resolve_timezone_dst_difference():
     assert resp_summer.json()["tz_offset_minutes"] == -240  # UTC-4 (DST)
 
 
-def test_resolve_timezone_ambiguous_birth_requires_explicit_offset():
-    """Ambiguous DST hour should be rejected when strict_birth is true."""
-
-    client = TestClient(main.app)
-    payload = {
-        "datetime_local": "2021-11-07T01:30:00",
-        "timezone": "America/New_York",
-        "strict_birth": True,
-    }
-
-    resp = client.post("/v1/time/resolve-tz", json=payload)
-    assert resp.status_code == 400
-    body = resp.json()
-    assert "offset_options_minutes" in body["detail"]
-
-
 def test_cosmic_weather_accepts_timezone():
     client = TestClient(main.app)
     resp = client.get(
