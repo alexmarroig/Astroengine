@@ -346,10 +346,21 @@ def _git_commit_hash() -> Optional[str]:
 
 
 def _mercury_alert_for(date: str, lat: float, lng: float, tz_offset_minutes: int) -> Optional[SystemAlert]:
+    """Return a Mercury retrograde alert for a validated YYYY-MM-DD date.
+
+    The date is parsed through ``_parse_date_yyyy_mm_dd`` to guarantee a clear
+    400 error for bad inputs (instead of silent ValueErrors) and to avoid
+    duplicating manual ``split("-")`` logic. Keeping a single, validated parse
+    path is the correct resolution for merge conflicts that show a second
+    ``compute_transits`` call using ``date.split("-")``: we only need one
+    transit computation after validation.
+    """
+
+    y, m, d = _parse_date_yyyy_mm_dd(date)
     chart = compute_transits(
-        target_year=int(date.split("-")[0]),
-        target_month=int(date.split("-")[1]),
-        target_day=int(date.split("-")[2]),
+        target_year=y,
+        target_month=m,
+        target_day=d,
         lat=lat,
         lng=lng,
         tz_offset_minutes=tz_offset_minutes,
@@ -404,7 +415,9 @@ def _tz_offset_for(date_time: datetime, timezone: Optional[str], fallback_minute
             tzinfo = ZoneInfo(timezone)
         except ZoneInfoNotFoundError:
             raise HTTPException(status_code=400, detail=f"Timezone inválido: {timezone}")
-        offset = tzinfo.utcoffset(date_time)
+
+        localized = date_time.replace(tzinfo=tzinfo)
+        offset = localized.utcoffset()
         if offset is None:
             raise HTTPException(status_code=400, detail=f"Timezone sem offset disponível: {timezone}")
         return int(offset.total_seconds() // 60)
@@ -467,7 +480,7 @@ async def resolve_timezone(body: TimezoneResolveRequest):
     except ZoneInfoNotFoundError:
         raise HTTPException(status_code=400, detail=f"Timezone inválido: {body.timezone}")
 
-    offset = tz.utcoffset(body.datetime_local)
+    offset = body.datetime_local.replace(tzinfo=tz).utcoffset()
     if offset is None:
         raise HTTPException(status_code=400, detail="Offset não disponível para o timezone informado.")
     return {"tz_offset_minutes": int(offset.total_seconds() // 60)}
@@ -595,15 +608,28 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
         raise HTTPException(status_code=500, detail=f"Erro ao calcular trânsitos: {str(e)}")
 
 @app.get("/v1/cosmic-weather", response_model=CosmicWeatherResponse)
-async def cosmic_weather(request: Request, date: Optional[str] = None, auth=Depends(get_auth)):
+async def cosmic_weather(
+    request: Request,
+    date: Optional[str] = None,
+    timezone: Optional[str] = Query(None, description="Timezone IANA"),
+    tz_offset_minutes: Optional[int] = Query(
+        None, ge=-840, le=840, description="Offset manual em minutos; ignorado se timezone for enviado."
+    ),
+    auth=Depends(get_auth),
+):
     d = date or _now_yyyy_mm_dd()
-    cache_key = f"cw:{auth['user_id']}:{d}"
+    _parse_date_yyyy_mm_dd(d)
+
+    dt = datetime.strptime(d, "%Y-%m-%d").replace(hour=12, minute=0, second=0)
+    resolved_offset = _tz_offset_for(dt, timezone, tz_offset_minutes)
+
+    cache_key = f"cw:{auth['user_id']}:{d}:{timezone}:{resolved_offset}"
 
     cached = cache.get(cache_key)
     if cached:
         return cached
 
-    moon = compute_moon_only(d)
+    moon = compute_moon_only(d, tz_offset_minutes=resolved_offset)
     phase = _moon_phase_4(moon["phase_angle_deg"])
     sign = moon["moon_sign"]
 
@@ -736,13 +762,16 @@ async def system_alerts(
     date: str,
     lat: float = Query(..., ge=-89.9999, le=89.9999),
     lng: float = Query(..., ge=-180, le=180),
-    tz_offset_minutes: int = Query(0, ge=-840, le=840),
+    timezone: Optional[str] = Query(None, description="Timezone IANA"),
+    tz_offset_minutes: Optional[int] = Query(None, ge=-840, le=840),
     auth=Depends(get_auth),
 ):
     _parse_date_yyyy_mm_dd(date)
+    dt = datetime.strptime(date, "%Y-%m-%d").replace(hour=12, minute=0, second=0)
+    resolved_offset = _tz_offset_for(dt, timezone, tz_offset_minutes)
     alerts: List[SystemAlert] = []
 
-    mercury = _mercury_alert_for(date, lat, lng, tz_offset_minutes)
+    mercury = _mercury_alert_for(date, lat, lng, resolved_offset)
     if mercury:
         alerts.append(mercury)
 
@@ -754,16 +783,20 @@ async def notifications_daily(
     date: Optional[str] = None,
     lat: float = Query(..., ge=-89.9999, le=89.9999),
     lng: float = Query(..., ge=-180, le=180),
-    tz_offset_minutes: int = Query(0, ge=-840, le=840),
+    timezone: Optional[str] = Query(None, description="Timezone IANA"),
+    tz_offset_minutes: Optional[int] = Query(None, ge=-840, le=840),
     auth=Depends(get_auth),
 ):
     d = date or _now_yyyy_mm_dd()
     _parse_date_yyyy_mm_dd(d)
-    cache_key = f"notif:{auth['user_id']}:{d}:{lat}:{lng}:{tz_offset_minutes}"
+    dt = datetime.strptime(d, "%Y-%m-%d").replace(hour=12, minute=0, second=0)
+    resolved_offset = _tz_offset_for(dt, timezone, tz_offset_minutes)
+
+    cache_key = f"notif:{auth['user_id']}:{d}:{lat}:{lng}:{timezone}:{resolved_offset}"
     cached = cache.get(cache_key)
     if cached:
         return cached
 
-    payload = _daily_notifications_payload(d, lat, lng, tz_offset_minutes)
+    payload = _daily_notifications_payload(d, lat, lng, resolved_offset)
     cache.set(cache_key, payload.model_dump(), ttl_seconds=TTL_COSMIC_WEATHER_SECONDS)
     return payload
