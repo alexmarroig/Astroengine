@@ -3,7 +3,7 @@ import time
 import uuid
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, Any, Dict, Literal, List
 from pathlib import Path
@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from openai import OpenAI
 
 from astro.ephemeris import compute_chart, compute_transits, compute_moon_only
@@ -248,6 +248,14 @@ class CosmicWeatherResponse(BaseModel):
     headline: str
     text: str
 
+
+class CosmicWeatherRangeResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from")
+    to: str
+    items: List[CosmicWeatherResponse]
+
 class RenderDataRequest(BaseModel):
     year: int
     month: int
@@ -436,6 +444,36 @@ TTL_TRANSITS_SECONDS = 6 * 3600
 TTL_RENDER_SECONDS = 30 * 24 * 3600
 TTL_COSMIC_WEATHER_SECONDS = 6 * 3600
 
+
+def _cosmic_weather_payload(
+    date_str: str, timezone: Optional[str], tz_offset_minutes: Optional[int], user_id: str
+) -> Dict[str, Any]:
+    """Compute (or fetch) the cosmic weather payload for a single day."""
+
+    _parse_date_yyyy_mm_dd(date_str)
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=12, minute=0, second=0)
+    resolved_offset = _tz_offset_for(dt, timezone, tz_offset_minutes)
+
+    cache_key = f"cw:{user_id}:{date_str}:{timezone}:{resolved_offset}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    moon = compute_moon_only(date_str, tz_offset_minutes=resolved_offset)
+    phase = _moon_phase_4(moon["phase_angle_deg"])
+    sign = moon["moon_sign"]
+
+    payload = {
+        "date": date_str,
+        "moon_phase": phase,
+        "moon_sign": sign,
+        "headline": f"Lua {phase} em {sign}",
+        "text": _cw_text(phase, sign),
+    }
+
+    cache.set(cache_key, payload, ttl_seconds=TTL_COSMIC_WEATHER_SECONDS)
+    return payload
+
 ROADMAP_FEATURES = {
     "notifications": {"status": "beta", "notes": "feed diário via API; push aguardando provedor"},
     "mercury_retrograde_alert": {
@@ -618,31 +656,43 @@ async def cosmic_weather(
     auth=Depends(get_auth),
 ):
     d = date or _now_yyyy_mm_dd()
-    _parse_date_yyyy_mm_dd(d)
+    payload = _cosmic_weather_payload(d, timezone, tz_offset_minutes, auth["user_id"])
+    return CosmicWeatherResponse(**payload)
 
-    dt = datetime.strptime(d, "%Y-%m-%d").replace(hour=12, minute=0, second=0)
-    resolved_offset = _tz_offset_for(dt, timezone, tz_offset_minutes)
 
-    cache_key = f"cw:{auth['user_id']}:{d}:{timezone}:{resolved_offset}"
+@app.get("/v1/cosmic-weather/range", response_model=CosmicWeatherRangeResponse)
+async def cosmic_weather_range(
+    request: Request,
+    from_: str = Query(..., alias="from", description="Data inicial no formato YYYY-MM-DD"),
+    to: str = Query(..., description="Data final no formato YYYY-MM-DD"),
+    timezone: Optional[str] = Query(None, description="Timezone IANA"),
+    tz_offset_minutes: Optional[int] = Query(
+        None, ge=-840, le=840, description="Offset manual em minutos; ignorado se timezone for enviado."
+    ),
+    auth=Depends(get_auth),
+):
+    start_y, start_m, start_d = _parse_date_yyyy_mm_dd(from_)
+    end_y, end_m, end_d = _parse_date_yyyy_mm_dd(to)
 
-    cached = cache.get(cache_key)
-    if cached:
-        return cached
+    start_date = datetime(year=start_y, month=start_m, day=start_d)
+    end_date = datetime(year=end_y, month=end_m, day=end_d)
 
-    moon = compute_moon_only(d, tz_offset_minutes=resolved_offset)
-    phase = _moon_phase_4(moon["phase_angle_deg"])
-    sign = moon["moon_sign"]
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="Parâmetro 'from' deve ser anterior ou igual a 'to'.")
 
-    payload = CosmicWeatherResponse(
-        date=d,
-        moon_phase=phase,
-        moon_sign=sign,
-        headline=f"Lua {phase} em {sign}",
-        text=_cw_text(phase, sign),
-    )
+    interval_days = (end_date - start_date).days + 1
+    if interval_days > 90:
+        raise HTTPException(status_code=400, detail="Intervalo máximo permitido é de 90 dias.")
 
-    cache.set(cache_key, payload.model_dump(), ttl_seconds=TTL_COSMIC_WEATHER_SECONDS)
-    return payload
+    items: List[CosmicWeatherResponse] = []
+    current = start_date
+    for _ in range(interval_days):
+        date_str = current.strftime("%Y-%m-%d")
+        payload = _cosmic_weather_payload(date_str, timezone, tz_offset_minutes, auth["user_id"])
+        items.append(CosmicWeatherResponse(**payload))
+        current += timedelta(days=1)
+
+    return CosmicWeatherRangeResponse(from_=from_, to=to, items=items)
 
 @app.post("/v1/chart/render-data")
 async def render_data(body: RenderDataRequest, request: Request, auth=Depends(get_auth)):
