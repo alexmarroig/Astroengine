@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+from typing import Literal, Optional
+
 import swisseph as swe
 
 from astro.utils import to_julian_day, deg_to_sign
@@ -30,6 +32,14 @@ HOUSE_SYSTEMS = {
 }
 
 
+AYANAMSA_MAP = {
+    "lahiri": swe.SIDM_LAHIRI,
+    "krishnamurti": swe.SIDM_KRISHNAMURTI,
+    "ramey": swe.SIDM_RAMAN,
+    "fagan_bradley": swe.SIDM_FAGAN_BRADLEY,
+}
+
+
 def compute_chart(
     year: int,
     month: int,
@@ -40,7 +50,9 @@ def compute_chart(
     lat: float,
     lng: float,
     tz_offset_minutes: int = 0,
-    house_system: str = 'P'
+    house_system: str = 'P',
+    zodiac_type: Literal['tropical', 'sidereal'] = 'tropical',
+    ayanamsa: Optional[str] = None,
 ) -> dict:
     local_dt = datetime(year, month, day, hour, minute, second)
     utc_dt = local_dt - timedelta(minutes=tz_offset_minutes)
@@ -60,6 +72,9 @@ def compute_chart(
         cusps, ascmc = swe.houses(jd_ut, lat, lng, b'P')
         house_system_code = "P"
 
+    if zodiac_type == "sidereal":
+        swe.set_sid_mode(AYANAMSA_MAP.get((ayanamsa or "lahiri").lower(), swe.SIDM_LAHIRI))
+
     houses_data = {
         "system": HOUSE_SYSTEMS.get(house_system_code, house_system_code),
         "cusps": [round(c, 6) for c in cusps],  # cusps[0]..cusps[11] (12 valores)
@@ -72,10 +87,13 @@ def compute_chart(
         result, _ = swe.calc_ut(jd_ut, planet_id)
         lon = result[0] % 360.0
         sign_info = deg_to_sign(lon)
+        speed = result[3] if len(result) > 3 else None
         planets_data[name] = {
             "lon": round(lon, 6),
             "sign": sign_info["sign"],
-            "deg_in_sign": round(sign_info["deg_in_sign"], 4)
+            "deg_in_sign": round(sign_info["deg_in_sign"], 4),
+            "speed": round(speed, 6) if speed is not None else None,
+            "retrograde": bool(speed is not None and speed < 0),
         }
 
     payload = {
@@ -96,7 +114,9 @@ def compute_transits(
     target_day: int,
     lat: float,
     lng: float,
-    tz_offset_minutes: int = 0
+    tz_offset_minutes: int = 0,
+    zodiac_type: Literal['tropical', 'sidereal'] = 'tropical',
+    ayanamsa: Optional[str] = None,
 ) -> dict:
     # 12:00 local como referência (estável)
     return compute_chart(
@@ -109,7 +129,9 @@ def compute_transits(
         lat=lat,
         lng=lng,
         tz_offset_minutes=tz_offset_minutes,
-        house_system='P'
+        house_system='P',
+        zodiac_type=zodiac_type,
+        ayanamsa=ayanamsa,
     )
 
 
