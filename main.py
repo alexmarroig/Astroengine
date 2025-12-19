@@ -346,6 +346,16 @@ def _git_commit_hash() -> Optional[str]:
 
 
 def _mercury_alert_for(date: str, lat: float, lng: float, tz_offset_minutes: int) -> Optional[SystemAlert]:
+    """Return a Mercury retrograde alert for a validated YYYY-MM-DD date.
+
+    The date is parsed through ``_parse_date_yyyy_mm_dd`` to guarantee a clear
+    400 error for bad inputs (instead of silent ValueErrors) and to avoid
+    duplicating manual ``split("-")`` logic. Keeping a single, validated parse
+    path is the correct resolution for merge conflicts that show a second
+    ``compute_transits`` call using ``date.split("-")``: we only need one
+    transit computation after validation.
+    """
+
     y, m, d = _parse_date_yyyy_mm_dd(date)
     chart = compute_transits(
         target_year=y,
