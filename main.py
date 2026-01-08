@@ -225,6 +225,7 @@ class TransitsRequest(BaseModel):
         description="Timezone IANA (ex.: America/Sao_Paulo). Se preenchido, substitui tz_offset_minutes",
     )
     target_date: str = Field(..., description="YYYY-MM-DD")
+    house_system: HouseSystem = Field(default=HouseSystem.PLACIDUS)
     zodiac_type: ZodiacType = Field(default=ZodiacType.TROPICAL)
     ayanamsa: Optional[str] = Field(
         default=None, description="Opcional para zodíaco sideral (ex.: lahiri, fagan_bradley)",
@@ -633,7 +634,7 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
             lat=body.lat,
             lng=body.lng,
             tz_offset_minutes=tz_offset_minutes,
-            house_system="P",
+            house_system=body.house_system.value,
             zodiac_type=body.zodiac_type.value,
             ayanamsa=body.ayanamsa,
         )
