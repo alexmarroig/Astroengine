@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 from openai import OpenAI
 
 from astro.ephemeris import compute_chart, compute_transits, compute_moon_only
-from astro.aspects import compute_transit_aspects
+from astro.aspects import compute_transit_aspects, ASPECTS
+from astro.utils import angle_diff
 from ai.prompts import build_cosmic_chat_messages
 
 from core.security import require_api_key_and_user
@@ -310,6 +311,45 @@ class NotificationsDailyResponse(BaseModel):
     date: str
     items: List[Dict[str, Any]]
 
+
+ASPECT_SYMBOLS = {
+    "Conjunction": "☌",
+    "Opposition": "☍",
+    "Square": "☐",
+    "Trine": "△",
+    "Sextile": "✶",
+}
+
+
+PLANET_LABELS_PT = {
+    "Sun": "Sol",
+    "Moon": "Lua",
+    "Mercury": "Mercúrio",
+    "Venus": "Vênus",
+    "Mars": "Marte",
+    "Jupiter": "Júpiter",
+    "Saturn": "Saturno",
+    "Uranus": "Urano",
+    "Neptune": "Netuno",
+    "Pluto": "Plutão",
+}
+
+
+HOUSE_THEMES = {
+    1: "clareie sua identidade",
+    2: "revise finanças e valores",
+    3: "comunique-se com calma",
+    4: "cuide da base e família",
+    5: "honre a criatividade",
+    6: "otimize rotinas e saúde",
+    7: "equilibre parcerias",
+    8: "encare transformações",
+    9: "expanda visão e estudos",
+    10: "estruture carreira",
+    11: "fortaleça redes e amigos",
+    12: "acolha o descanso e o invisível",
+}
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -319,6 +359,49 @@ def _parse_date_yyyy_mm_dd(s: str) -> tuple[int, int, int]:
         return parsed.year, parsed.month, parsed.day
     except ValueError:
         raise HTTPException(status_code=400, detail="Formato inválido de data. Use YYYY-MM-DD.")
+
+
+def _bucket_datetime(dt: datetime, bucket_minutes: int = 10) -> datetime:
+    base_minute = (dt.minute // bucket_minutes) * bucket_minutes
+    return dt.replace(minute=base_minute, second=0, microsecond=0)
+
+
+def _planet_label(name: str) -> str:
+    return PLANET_LABELS_PT.get(name, name)
+
+
+def _aspect_symbol(name: str) -> str:
+    return ASPECT_SYMBOLS.get(name, "∠")
+
+
+def _aspect_guidance_phrase(aspect: str) -> str:
+    hints = {
+        "Conjunction": "una forças com intenção",
+        "Opposition": "busque equilíbrio",
+        "Square": "aja com foco",
+        "Trine": "flua com oportunidades",
+        "Sextile": "troque ideias com abertura",
+    }
+    return hints.get(aspect, "observe os sinais")
+
+
+def _house_theme(house: int) -> str:
+    return HOUSE_THEMES.get(house, "observe a área da casa")
+
+
+def _build_aspect_summary(
+    transit: str, target: str, aspect: str, target_type: Literal["planet", "house"], house: int | None = None
+) -> str:
+    transit_label = _planet_label(transit)
+    aspect_symbol = _aspect_symbol(aspect)
+    hint = _aspect_guidance_phrase(aspect)
+
+    if target_type == "house" and house is not None:
+        target_label = f"Casa {house}"
+        return f"{transit_label} {aspect_symbol} {target_label} — {_house_theme(house)}"
+
+    target_label = f"{_planet_label(target)} natal"
+    return f"{transit_label} {aspect_symbol} {target_label} — {hint}"
 
 def _moon_phase_4(phase_angle_deg: float) -> str:
     a = phase_angle_deg % 360
@@ -434,6 +517,41 @@ def _tz_offset_for(date_time: datetime, timezone: Optional[str], fallback_minute
         return fallback_minutes
 
     return 0
+
+
+def _filter_planetary_aspects(aspects: List[dict], max_orb: Optional[float]) -> List[dict]:
+    if max_orb is None:
+        return aspects
+    return [a for a in aspects if a.get("orb") is not None and a["orb"] <= max_orb]
+
+
+def _planet_house_aspects(
+    transit_planets: Dict[str, dict], house_cusps: List[float], max_orb: float
+) -> List[dict]:
+    house_aspects: List[dict] = []
+    for t_name, t_data in transit_planets.items():
+        t_lon = t_data.get("lon")
+        if t_lon is None:
+            continue
+
+        for idx, cusp in enumerate(house_cusps, start=1):
+            for aspect_name, aspect_info in ASPECTS.items():
+                separation = angle_diff(t_lon, cusp)
+                orb = abs(separation - aspect_info["angle"])
+                if orb <= max_orb:
+                    house_aspects.append(
+                        {
+                            "transit_planet": t_name,
+                            "house": idx,
+                            "aspect": aspect_name,
+                            "exact_angle": aspect_info["angle"],
+                            "actual_angle": round(separation, 4),
+                            "orb": round(orb, 4),
+                        }
+                    )
+
+    house_aspects.sort(key=lambda x: x["orb"])
+    return house_aspects
 
 
 # -----------------------------
@@ -565,6 +683,129 @@ async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth
             extra={"request_id": getattr(request.state, "request_id", None), "path": request.url.path},
         )
         raise HTTPException(status_code=500, detail=f"Erro ao calcular mapa natal: {str(e)}")
+
+
+@app.get("/v1/transits/live")
+async def live_transits(
+    target_datetime: datetime = Query(..., description="Data/hora local (ISO) para calcular o trânsito"),
+    natal_year: int = Query(..., ge=1800, le=2100),
+    natal_month: int = Query(..., ge=1, le=12),
+    natal_day: int = Query(..., ge=1, le=31),
+    natal_hour: int = Query(..., ge=0, le=23),
+    natal_minute: int = Query(0, ge=0, le=59),
+    natal_second: int = Query(0, ge=0, le=59),
+    lat: float = Query(..., ge=-89.9999, le=89.9999),
+    lng: float = Query(..., ge=-180, le=180),
+    timezone: Optional[str] = Query(None, description="Timezone IANA"),
+    tz_offset_minutes: Optional[int] = Query(None, ge=-840, le=840),
+    house_system: HouseSystem = Query(default=HouseSystem.PLACIDUS),
+    zodiac_type: ZodiacType = Query(default=ZodiacType.TROPICAL),
+    ayanamsa: Optional[str] = Query(
+        default=None, description="Opcional para zodíaco sideral (ex.: lahiri, fagan_bradley)"
+    ),
+    orb_planetary: Optional[float] = Query(
+        None, ge=0, le=10, description="Filtra aspectos planeta-planeta até este orbe (graus)."
+    ),
+    orb_house: float = Query(3.0, ge=0, le=10, description="Orbe para aspectos com cúspides de casas."),
+    auth=Depends(get_auth),
+):
+    dt = target_datetime.replace(tzinfo=None)
+    resolved_offset = _tz_offset_for(dt, timezone, tz_offset_minutes)
+    bucket = _bucket_datetime(dt)
+
+    natal_dt = datetime(
+        year=natal_year,
+        month=natal_month,
+        day=natal_day,
+        hour=natal_hour,
+        minute=natal_minute,
+        second=natal_second,
+    )
+    natal_offset = _tz_offset_for(natal_dt, timezone, tz_offset_minutes)
+
+    cache_key = (
+        f"live_transits:{auth['user_id']}:{bucket.isoformat()}:{lat}:{lng}:{timezone}:{resolved_offset}:"
+        f"{zodiac_type.value}:{ayanamsa}:{house_system.value}:{orb_planetary}:{orb_house}:"
+        f"{natal_dt.isoformat()}"
+    )
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    natal_chart = compute_chart(
+        year=natal_year,
+        month=natal_month,
+        day=natal_day,
+        hour=natal_hour,
+        minute=natal_minute,
+        second=natal_second,
+        lat=lat,
+        lng=lng,
+        tz_offset_minutes=natal_offset,
+        house_system=house_system.value,
+        zodiac_type=zodiac_type.value,
+        ayanamsa=ayanamsa,
+    )
+
+    cusps = natal_chart.get("houses", {}).get("cusps")
+    if not cusps:
+        raise HTTPException(status_code=500, detail="Mapa natal não retornou cúspides de casas.")
+
+    transit_chart = compute_chart(
+        year=dt.year,
+        month=dt.month,
+        day=dt.day,
+        hour=dt.hour,
+        minute=dt.minute,
+        second=dt.second,
+        lat=lat,
+        lng=lng,
+        tz_offset_minutes=resolved_offset,
+        house_system="P",
+        zodiac_type=zodiac_type.value,
+        ayanamsa=ayanamsa,
+    )
+
+    daily_transits = compute_transits(
+        target_year=dt.year,
+        target_month=dt.month,
+        target_day=dt.day,
+        lat=lat,
+        lng=lng,
+        tz_offset_minutes=resolved_offset,
+        zodiac_type=zodiac_type.value,
+        ayanamsa=ayanamsa,
+    )
+
+    planetary_aspects = compute_transit_aspects(
+        transit_planets=transit_chart["planets"], natal_planets=natal_chart["planets"]
+    )
+    planetary_aspects = _filter_planetary_aspects(planetary_aspects, orb_planetary)
+    for aspect in planetary_aspects:
+        aspect["summary"] = _build_aspect_summary(
+            aspect["transit_planet"], aspect["natal_planet"], aspect["aspect"], target_type="planet"
+        )
+
+    house_aspects = _planet_house_aspects(transit_chart["planets"], cusps, orb_house)
+    for aspect in house_aspects:
+        aspect["summary"] = _build_aspect_summary(
+            aspect["transit_planet"], str(aspect["house"]), aspect["aspect"], target_type="house", house=aspect["house"]
+        )
+
+    response = {
+        "target_datetime": dt.isoformat(),
+        "bucket_start": bucket.isoformat(),
+        "tz_offset_minutes": resolved_offset,
+        "natal": {"datetime": natal_dt.isoformat(), "chart": natal_chart},
+        "transits": transit_chart,
+        "daily_snapshot": daily_transits,
+        "planetary_aspects": planetary_aspects,
+        "house_aspects": house_aspects,
+        "guidance": [a["summary"] for a in planetary_aspects + house_aspects],
+    }
+
+    cache.set(cache_key, response, ttl_seconds=TTL_TRANSITS_SECONDS)
+    return response
 
 @app.post("/v1/chart/transits")
 async def transits(body: TransitsRequest, request: Request, auth=Depends(get_auth)):
