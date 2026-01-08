@@ -300,6 +300,39 @@ class RenderDataRequest(BaseModel):
         return self
 
 
+class TransitsLiveRequest(BaseModel):
+    target_datetime: datetime = Field(..., description="Data/hora local alvo, ex.: 2025-12-19T14:30:00")
+    lat: float = Field(..., ge=-89.9999, le=89.9999)
+    lng: float = Field(..., ge=-180, le=180)
+    tz_offset_minutes: Optional[int] = Field(
+        None, ge=-840, le=840, description="Minutos de offset para o fuso. Se vazio, usa timezone."
+    )
+    timezone: Optional[str] = Field(
+        None,
+        description="Timezone IANA (ex.: America/Sao_Paulo). Se preenchido, substitui tz_offset_minutes",
+    )
+    zodiac_type: ZodiacType = Field(default=ZodiacType.TROPICAL)
+    ayanamsa: Optional[str] = Field(
+        default=None, description="Opcional para zodíaco sideral (ex.: lahiri, fagan_bradley)",
+    )
+    strict_timezone: bool = Field(
+        default=False,
+        description="Quando true, rejeita horários ambíguos em transições de DST para evitar datas erradas.",
+    )
+
+    @model_validator(mode="after")
+    def validate_tz(self):
+        offset = None
+        if self.target_datetime.tzinfo is not None:
+            offset = self.target_datetime.utcoffset()
+        if self.tz_offset_minutes is None and not self.timezone and offset is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Informe timezone IANA, tz_offset_minutes ou target_datetime com offset.",
+            )
+        return self
+
+
 class TimezoneResolveRequest(BaseModel):
     datetime_local: datetime = Field(..., description="Data/hora local, ex.: 2025-12-19T14:30:00")
     timezone: str = Field(..., description="Timezone IANA, ex.: America/Sao_Paulo")
@@ -677,6 +710,54 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
     except Exception as e:
         logger.error(
             "transits_error",
+            exc_info=True,
+            extra={"request_id": getattr(request.state, "request_id", None), "path": request.url.path},
+        )
+        raise HTTPException(status_code=500, detail=f"Erro ao calcular trânsitos: {str(e)}")
+
+@app.post("/v1/transits/live")
+async def transits_live(body: TransitsLiveRequest, request: Request, auth=Depends(get_auth)):
+    target_dt = body.target_datetime
+    tz_offset_minutes = body.tz_offset_minutes
+
+    if body.timezone or tz_offset_minutes is not None:
+        local_dt = target_dt.replace(tzinfo=None)
+    else:
+        offset = target_dt.utcoffset()
+        if offset is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Informe timezone IANA, tz_offset_minutes ou target_datetime com offset.",
+            )
+        tz_offset_minutes = int(offset.total_seconds() // 60)
+        local_dt = target_dt.replace(tzinfo=None)
+
+    resolved_offset = _tz_offset_for(
+        local_dt, body.timezone, tz_offset_minutes, strict=body.strict_timezone
+    )
+    target_date = local_dt.strftime("%Y-%m-%d")
+
+    try:
+        transit_chart = compute_transits(
+            target_year=local_dt.year,
+            target_month=local_dt.month,
+            target_day=local_dt.day,
+            lat=body.lat,
+            lng=body.lng,
+            tz_offset_minutes=resolved_offset,
+            zodiac_type=body.zodiac_type.value,
+            ayanamsa=body.ayanamsa,
+        )
+
+        return {
+            "date": target_date,
+            "target_datetime": target_dt.isoformat(),
+            "tz_offset_minutes": resolved_offset,
+            "transits": transit_chart,
+        }
+    except Exception as e:
+        logger.error(
+            "transits_live_error",
             exc_info=True,
             extra={"request_id": getattr(request.state, "request_id", None), "path": request.url.path},
         )
