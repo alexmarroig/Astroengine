@@ -7,6 +7,7 @@ ZODIAC_SIGNS = [
 ]
 
 
+
 def to_julian_day(dt: datetime) -> float:
     year = dt.year
     month = dt.month

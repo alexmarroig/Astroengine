@@ -60,10 +60,11 @@ def test_range_rejects_over_90_days():
     client = TestClient(main.app)
     resp = client.get(
         "/v1/cosmic-weather/range",
-        params={"from": "2024-01-01", "to": "2024-04-05", "timezone": "Etc/UTC"},
+        params={"from": "2024-01-01", "to": "2024-02-15", "timezone": "Etc/UTC"},
         headers=_auth_headers(),
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Range too large. Max 31 days. Use smaller windows."
 
 
 def test_range_accepts_manual_tz_offset():
@@ -88,6 +89,17 @@ def test_range_accepts_timezone_name():
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["items"]) == 2
+
+
+def test_range_rejects_invalid_timezone():
+    client = TestClient(main.app)
+    resp = client.get(
+        "/v1/cosmic-weather/range",
+        params={"from": "2024-01-01", "to": "2024-01-02", "timezone": "Mars/Crater"},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Invalid timezone. Use an IANA timezone like America/Sao_Paulo."
 
 
 def test_range_requires_auth_headers():
