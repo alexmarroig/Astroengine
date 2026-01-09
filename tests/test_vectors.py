@@ -30,6 +30,11 @@ def test_natal_chart_test_vector_pt_br():
     }
 
     resp = client.post("/v1/chart/natal", json=payload, headers=_auth_headers())
+    resp = client.post(
+        "/v1/chart/natal?lang=pt-BR",
+        json=payload,
+        headers=_auth_headers(),
+    )
     assert resp.status_code == 200
 
     chart = resp.json()
@@ -40,3 +45,9 @@ def test_natal_chart_test_vector_pt_br():
     assert sun["deg_in_sign"] == pytest.approx(15.14, abs=0.5)
 
     assert moon["sign"] == "Taurus"
+    assert sun["sign"] == "Escorpião"
+    assert sun["sign_pt"] == "Escorpião"
+    assert sun["deg_in_sign"] == pytest.approx(15.14, abs=0.5)
+
+    assert moon["sign"] == "Touro"
+    assert moon["sign_pt"] == "Touro"
