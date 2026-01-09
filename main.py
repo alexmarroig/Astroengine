@@ -16,9 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from openai import OpenAI
+import swisseph as swe
 
-from astro.ephemeris import compute_chart, compute_transits, compute_moon_only
+from astro.ephemeris import PLANETS, compute_chart, compute_transits, compute_moon_only
 from astro.aspects import compute_transit_aspects
+from astro.utils import angle_diff, to_julian_day
 from ai.prompts import build_cosmic_chat_messages
 
 from core.security import require_api_key_and_user
@@ -225,6 +227,7 @@ class TransitsRequest(BaseModel):
         description="Timezone IANA (ex.: America/Sao_Paulo). Se preenchido, substitui tz_offset_minutes",
     )
     target_date: str = Field(..., description="YYYY-MM-DD")
+    house_system: HouseSystem = Field(default=HouseSystem.PLACIDUS)
     zodiac_type: ZodiacType = Field(default=ZodiacType.TROPICAL)
     ayanamsa: Optional[str] = Field(
         default=None, description="Opcional para zodíaco sideral (ex.: lahiri, fagan_bradley)",
@@ -307,6 +310,13 @@ class TimezoneResolveRequest(BaseModel):
         default=False,
         description="Quando true, acusa horários ambíguos em transições de DST para dados de nascimento.",
     )
+
+
+class EphemerisCheckRequest(BaseModel):
+    datetime_local: datetime = Field(..., description="Data/hora local, ex.: 2024-01-01T12:00:00")
+    timezone: str = Field(..., description="Timezone IANA, ex.: Etc/UTC")
+    lat: float = Field(..., ge=-89.9999, le=89.9999)
+    lng: float = Field(..., ge=-180, le=180)
 
 
 class SystemAlert(BaseModel):
@@ -558,6 +568,48 @@ async def resolve_timezone(body: TimezoneResolveRequest):
     )
     return {"tz_offset_minutes": resolved_offset}
 
+@app.post("/v1/diagnostics/ephemeris-check")
+async def ephemeris_check(body: EphemerisCheckRequest, request: Request, auth=Depends(get_auth)):
+    tz_offset_minutes = _tz_offset_for(body.datetime_local, body.timezone, fallback_minutes=None)
+    utc_dt = body.datetime_local - timedelta(minutes=tz_offset_minutes)
+    jd_ut = to_julian_day(utc_dt)
+
+    chart = compute_chart(
+        year=body.datetime_local.year,
+        month=body.datetime_local.month,
+        day=body.datetime_local.day,
+        hour=body.datetime_local.hour,
+        minute=body.datetime_local.minute,
+        second=body.datetime_local.second,
+        lat=body.lat,
+        lng=body.lng,
+        tz_offset_minutes=tz_offset_minutes,
+        house_system="P",
+        zodiac_type="tropical",
+        ayanamsa=None,
+    )
+
+    items = []
+    for name, planet_id in PLANETS.items():
+        result, _ = swe.calc_ut(jd_ut, planet_id)
+        ref_lon = result[0] % 360.0
+        chart_lon = float(chart["planets"][name]["lon"])
+        delta = angle_diff(chart_lon, ref_lon)
+        items.append(
+            {
+                "planet": name,
+                "chart_lon": round(chart_lon, 6),
+                "ref_lon": round(ref_lon, 6),
+                "delta_deg_abs": round(delta, 6),
+            }
+        )
+
+    return {
+        "utc_datetime": utc_dt.isoformat(),
+        "tz_offset_minutes": tz_offset_minutes,
+        "items": items,
+    }
+
 @app.post("/v1/chart/natal")
 async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth)):
     try:
@@ -633,7 +685,7 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
             lat=body.lat,
             lng=body.lng,
             tz_offset_minutes=tz_offset_minutes,
-            house_system="P",
+            house_system=body.house_system.value,
             zodiac_type=body.zodiac_type.value,
             ayanamsa=body.ayanamsa,
         )
