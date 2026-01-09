@@ -2,11 +2,11 @@ from typing import List, Dict
 from astro.utils import angle_diff
 
 ASPECTS = {
-    "Conjunction": {"angle": 0, "orb": 6, "influence": "Intense influence"},
-    "Opposition": {"angle": 180, "orb": 6, "influence": "Challenging influence"},
-    "Square": {"angle": 90, "orb": 5, "influence": "Challenging influence"},
-    "Trine": {"angle": 120, "orb": 5, "influence": "Fluid influence"},
-    "Sextile": {"angle": 60, "orb": 4, "influence": "Fluid influence"}
+    "conjunction": {"angle": 0, "orb": 6, "influence": "intense"},
+    "opposition": {"angle": 180, "orb": 6, "influence": "challenging"},
+    "square": {"angle": 90, "orb": 5, "influence": "challenging"},
+    "trine": {"angle": 120, "orb": 5, "influence": "supportive"},
+    "sextile": {"angle": 60, "orb": 4, "influence": "supportive"},
 }
 
 
@@ -38,7 +38,7 @@ def compute_transit_aspects(
                         "exact_angle": target_angle,
                         "actual_angle": round(separation, 4),
                         "orb": round(orb, 4),
-                        "influence": aspect_info["influence"]
+                        "influence": aspect_info["influence"],
                     })
     
     aspects_found.sort(key=lambda x: x["orb"])

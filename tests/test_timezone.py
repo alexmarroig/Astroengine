@@ -18,7 +18,12 @@ def _auth_headers():
 def test_resolve_timezone_utc():
     client = TestClient(main.app)
     payload = {
-        "datetime_local": "2024-12-01T12:00:00",
+        "year": 2024,
+        "month": 12,
+        "day": 1,
+        "hour": 12,
+        "minute": 0,
+        "second": 0,
         "timezone": "Etc/UTC",
     }
     resp = client.post("/v1/time/resolve-tz", json=payload)
@@ -29,8 +34,24 @@ def test_resolve_timezone_utc():
 def test_resolve_timezone_dst_difference():
     """Ensure DST-aware offsets come from timezone data, not hardcoded minutes."""
     client = TestClient(main.app)
-    winter = {"datetime_local": "2024-01-15T12:00:00", "timezone": "America/New_York"}
-    summer = {"datetime_local": "2024-07-15T12:00:00", "timezone": "America/New_York"}
+    winter = {
+        "year": 2024,
+        "month": 1,
+        "day": 15,
+        "hour": 12,
+        "minute": 0,
+        "second": 0,
+        "timezone": "America/New_York",
+    }
+    summer = {
+        "year": 2024,
+        "month": 7,
+        "day": 15,
+        "hour": 12,
+        "minute": 0,
+        "second": 0,
+        "timezone": "America/New_York",
+    }
 
     resp_winter = client.post("/v1/time/resolve-tz", json=winter)
     resp_summer = client.post("/v1/time/resolve-tz", json=summer)

@@ -15,10 +15,14 @@ from fastapi import FastAPI, HTTPException, Request, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, model_validator
+from fastapi.exceptions import RequestValidationError
 from openai import OpenAI
+import swisseph as swe
 
-from astro.ephemeris import compute_chart, compute_transits, compute_moon_only
+from astro.ephemeris import PLANETS, compute_chart, compute_transits, compute_moon_only
 from astro.aspects import compute_transit_aspects
+from astro.retrogrades import retrograde_alerts
+from astro.utils import angle_diff, to_julian_day, ZODIAC_SIGNS
 from ai.prompts import build_cosmic_chat_messages
 
 from core.security import require_api_key_and_user
@@ -123,7 +127,12 @@ async def request_logging_middleware(request: Request, call_next):
         logger.error("unhandled_exception", exc_info=True, extra=extra)
         return JSONResponse(
             status_code=500,
-            content={"detail": "Erro interno no servidor.", "request_id": request_id},
+            content={
+                "detail": "Erro interno no servidor.",
+                "request_id": request_id,
+                "code": "internal_error",
+            },
+            headers={"X-Request-Id": request_id},
         )
 
 # -----------------------------
@@ -131,7 +140,7 @@ async def request_logging_middleware(request: Request, call_next):
 # -----------------------------
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    request_id = getattr(request.state, "request_id", None)
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
     extra = {
         "request_id": request_id,
         "path": request.url.path,
@@ -139,10 +148,33 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         "latency_ms": None,
     }
     _log("warning", "http_exception", **extra)
-    payload = {"detail": exc.detail}
-    if request_id:
-        payload["request_id"] = request_id
-    return JSONResponse(status_code=exc.status_code, content=payload)
+    payload = {
+        "detail": exc.detail,
+        "request_id": request_id,
+        "code": f"http_{exc.status_code}",
+    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=payload,
+        headers={"X-Request-Id": request_id},
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+    extra = {
+        "request_id": request_id,
+        "path": request.url.path,
+        "status": 422,
+        "latency_ms": None,
+    }
+    _log("warning", "validation_error", **extra)
+    payload = {
+        "detail": exc.errors(),
+        "request_id": request_id,
+        "code": "validation_error",
+    }
+    return JSONResponse(status_code=422, content=payload, headers={"X-Request-Id": request_id})
 
 # -----------------------------
 # Auth dependency
@@ -174,12 +206,12 @@ class ZodiacType(str, Enum):
 
 
 class NatalChartRequest(BaseModel):
-    year: int = Field(..., ge=1800, le=2100)
-    month: int = Field(..., ge=1, le=12)
-    day: int = Field(..., ge=1, le=31)
-    hour: int = Field(..., ge=0, le=23)
-    minute: int = Field(0, ge=0, le=59)
-    second: int = Field(0, ge=0, le=59)
+    natal_year: int = Field(..., ge=1800, le=2100)
+    natal_month: int = Field(..., ge=1, le=12)
+    natal_day: int = Field(..., ge=1, le=31)
+    natal_hour: int = Field(..., ge=0, le=23)
+    natal_minute: int = Field(0, ge=0, le=59)
+    natal_second: int = Field(0, ge=0, le=59)
     lat: float = Field(..., ge=-89.9999, le=89.9999)
     lng: float = Field(..., ge=-180, le=180)
     tz_offset_minutes: Optional[int] = Field(
@@ -225,6 +257,7 @@ class TransitsRequest(BaseModel):
         description="Timezone IANA (ex.: America/Sao_Paulo). Se preenchido, substitui tz_offset_minutes",
     )
     target_date: str = Field(..., description="YYYY-MM-DD")
+    house_system: HouseSystem = Field(default=HouseSystem.PLACIDUS)
     zodiac_type: ZodiacType = Field(default=ZodiacType.TROPICAL)
     ayanamsa: Optional[str] = Field(
         default=None, description="Opcional para zodíaco sideral (ex.: lahiri, fagan_bradley)",
@@ -242,6 +275,19 @@ class TransitsRequest(BaseModel):
                 detail="Informe timezone IANA ou tz_offset_minutes para calcular trânsitos.",
             )
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_date_aliases(cls, data: Any):
+        if isinstance(data, dict):
+            has_year_fields = any(key in data for key in ("year", "month", "day", "hour"))
+            has_natal_fields = any(key.startswith("natal_") for key in data.keys())
+            if has_year_fields and not has_natal_fields:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Use natal_year/natal_month/natal_day/natal_hour... for transits.",
+                )
+        return data
 
 class CosmicChatRequest(BaseModel):
     user_question: str = Field(..., min_length=1)
@@ -301,13 +347,60 @@ class RenderDataRequest(BaseModel):
 
 
 class TimezoneResolveRequest(BaseModel):
-    datetime_local: datetime = Field(..., description="Data/hora local, ex.: 2025-12-19T14:30:00")
+    year: int = Field(..., ge=1800, le=2100)
+    month: int = Field(..., ge=1, le=12)
+    day: int = Field(..., ge=1, le=31)
+    hour: int = Field(..., ge=0, le=23)
+    minute: int = Field(0, ge=0, le=59)
+    second: int = Field(0, ge=0, le=59)
     timezone: str = Field(..., description="Timezone IANA, ex.: America/Sao_Paulo")
     strict_birth: bool = Field(
         default=False,
         description="Quando true, acusa horários ambíguos em transições de DST para dados de nascimento.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_natal_aliases(cls, data: Any):
+        if isinstance(data, dict) and any(key.startswith("natal_") for key in data.keys()):
+            raise HTTPException(
+                status_code=422,
+                detail="Use year/month/day/hour/minute/second for resolve-tz (not natal_*).",
+            )
+        return data
+
+
+class EphemerisCheckRequest(BaseModel):
+    datetime_local: datetime = Field(..., description="Data/hora local, ex.: 2024-01-01T12:00:00")
+    timezone: str = Field(..., description="Timezone IANA, ex.: Etc/UTC")
+    lat: float = Field(..., ge=-89.9999, le=89.9999)
+    lng: float = Field(..., ge=-180, le=180)
+
+
+class MercuryRetrogradeRequest(BaseModel):
+    target_date: str = Field(..., description="YYYY-MM-DD")
+    lat: float = Field(..., ge=-89.9999, le=89.9999)
+    lng: float = Field(..., ge=-180, le=180)
+    tz_offset_minutes: Optional[int] = Field(
+        None, ge=-840, le=840, description="Minutos de offset para o fuso. Se vazio, usa timezone."
+    )
+    timezone: Optional[str] = Field(
+        None,
+        description="Timezone IANA (ex.: America/Sao_Paulo). Se preenchido, substitui tz_offset_minutes",
+    )
+    zodiac_type: ZodiacType = Field(default=ZodiacType.TROPICAL)
+    ayanamsa: Optional[str] = Field(
+        default=None, description="Opcional para zodíaco sideral (ex.: lahiri, fagan_bradley)",
+    )
+
+    @model_validator(mode="after")
+    def validate_tz(self):
+        if self.tz_offset_minutes is None and not self.timezone:
+            raise HTTPException(
+                status_code=400,
+                detail="Informe timezone IANA ou tz_offset_minutes para calcular retrogradação.",
+            )
+        return self
 
 class SystemAlert(BaseModel):
     id: str
@@ -339,12 +432,21 @@ def _parse_date_yyyy_mm_dd(s: str) -> tuple[int, int, int]:
 def _moon_phase_4(phase_angle_deg: float) -> str:
     a = phase_angle_deg % 360
     if a < 45 or a >= 315:
-        return "Nova"
+        return "new_moon"
     if 45 <= a < 135:
-        return "Crescente"
+        return "waxing"
     if 135 <= a < 225:
-        return "Cheia"
-    return "Minguante"
+        return "full_moon"
+    return "waning"
+
+def _moon_phase_label_pt(phase: str) -> str:
+    labels = {
+        "new_moon": "Nova",
+        "waxing": "Crescente",
+        "full_moon": "Cheia",
+        "waning": "Minguante",
+    }
+    return labels.get(phase, phase)
 
 def _cw_text(phase: str, sign: str) -> str:
     options = [
@@ -353,6 +455,135 @@ def _cw_text(phase: str, sign: str) -> str:
         "A energia pode ficar mais intensa em alguns momentos. Pausas curtas e ritmo consistente ajudam.",
     ]
     return options[hash(phase + sign) % len(options)]
+
+def _build_transits_context(
+    body: TransitsRequest, tz_offset_minutes: int
+) -> Dict[str, Any]:
+    target_y, target_m, target_d = _parse_date_yyyy_mm_dd(body.target_date)
+    natal_chart = compute_chart(
+        year=body.natal_year,
+        month=body.natal_month,
+        day=body.natal_day,
+        hour=body.natal_hour,
+        minute=body.natal_minute,
+        second=body.natal_second,
+        lat=body.lat,
+        lng=body.lng,
+        tz_offset_minutes=tz_offset_minutes,
+        house_system=body.house_system.value,
+        zodiac_type=body.zodiac_type.value,
+        ayanamsa=body.ayanamsa,
+    )
+
+    transit_chart = compute_transits(
+        target_year=target_y,
+        target_month=target_m,
+        target_day=target_d,
+        lat=body.lat,
+        lng=body.lng,
+        tz_offset_minutes=tz_offset_minutes,
+        zodiac_type=body.zodiac_type.value,
+        ayanamsa=body.ayanamsa,
+    )
+
+    aspects = compute_transit_aspects(
+        transit_planets=transit_chart["planets"],
+        natal_planets=natal_chart["planets"],
+    )
+
+    return {
+        "natal": natal_chart,
+        "transits": transit_chart,
+        "aspects": aspects,
+    }
+
+def _areas_activated(aspects: List[Dict[str, Any]], moon_phase: Optional[str] = None) -> List[Dict[str, Any]]:
+    base_score = 50.0
+    orb_max_default = 6.0
+
+    area_config = {
+        "Emoções": {"planets": {"Moon", "Neptune", "Pluto"}},
+        "Relações": {"planets": {"Venus", "Mars"}},
+        "Trabalho": {"planets": {"Sun", "Saturn", "Jupiter"}},
+        "Corpo": {"planets": {"Mars", "Saturn", "Sun"}},
+    }
+
+    scores: Dict[str, Dict[str, Any]] = {
+        area: {"score": base_score, "top_aspect": None, "top_weight": 0.0}
+        for area in area_config.keys()
+    }
+
+    aspect_weights = {
+        "conjunction": 14,
+        "opposition": 14,
+        "square": 12,
+        "trine": 9,
+        "sextile": 7,
+    }
+    supportive = {"trine", "sextile"}
+    challenging = {"square", "opposition"}
+    conjunction_positive = {"Venus", "Jupiter"}
+    conjunction_negative = {"Mars", "Saturn", "Pluto"}
+
+    for asp in aspects:
+        aspect_type = asp.get("aspect")
+        if aspect_type not in aspect_weights:
+            continue
+        orb = float(asp.get("orb", 0.0))
+        orb_max = orb_max_default
+        weight = aspect_weights[aspect_type] * max(0.0, 1.0 - (orb / orb_max))
+
+        sign = 0.0
+        if aspect_type in supportive:
+            sign = 1.0
+        elif aspect_type in challenging:
+            sign = -1.0
+        elif aspect_type == "conjunction":
+            planets = {asp.get("transit_planet"), asp.get("natal_planet")}
+            if planets & conjunction_negative:
+                sign = -0.5
+            elif planets & conjunction_positive:
+                sign = 0.5
+
+        for area, config in area_config.items():
+            if asp.get("transit_planet") in config["planets"] or asp.get("natal_planet") in config["planets"]:
+                scores[area]["score"] += weight * sign
+                if abs(weight * sign) > scores[area]["top_weight"]:
+                    scores[area]["top_weight"] = abs(weight * sign)
+                    scores[area]["top_aspect"] = asp
+
+    if moon_phase in {"full_moon", "new_moon"}:
+        scores["Emoções"]["score"] += 3
+
+    items = []
+    for area, data in scores.items():
+        score = max(0, min(100, round(data["score"], 1)))
+        if score <= 34:
+            level = "low"
+        elif score <= 59:
+            level = "medium"
+        elif score <= 79:
+            level = "high"
+        else:
+            level = "intense"
+
+        reason = "No strong aspects detected."
+        if data["top_aspect"]:
+            asp = data["top_aspect"]
+            reason = (
+                f"Top aspect: {asp.get('transit_planet')} {asp.get('aspect')} {asp.get('natal_planet')}."
+            )
+
+        items.append(
+            {
+                "area": area,
+                "level": level,
+                "score": score,
+                "reason": reason,
+            }
+        )
+
+    return items
 
 def _now_yyyy_mm_dd() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
@@ -486,7 +717,10 @@ TTL_COSMIC_WEATHER_SECONDS = 6 * 3600
 
 
 def _cosmic_weather_payload(
-    date_str: str, timezone: Optional[str], tz_offset_minutes: Optional[int], user_id: str
+    date_str: str,
+    timezone: Optional[str],
+    tz_offset_minutes: Optional[int],
+    user_id: str,
 ) -> Dict[str, Any]:
     """Compute (or fetch) the cosmic weather payload for a single day."""
 
@@ -502,12 +736,13 @@ def _cosmic_weather_payload(
     moon = compute_moon_only(date_str, tz_offset_minutes=resolved_offset)
     phase = _moon_phase_4(moon["phase_angle_deg"])
     sign = moon["moon_sign"]
+    phase_label = _moon_phase_label_pt(phase)
 
     payload = {
         "date": date_str,
         "moon_phase": phase,
         "moon_sign": sign,
-        "headline": f"Lua {phase} em {sign}",
+        "headline": f"Lua {phase_label} em {sign}",
         "text": _cw_text(phase, sign),
     }
 
@@ -553,21 +788,290 @@ async def roadmap():
 
 @app.post("/v1/time/resolve-tz")
 async def resolve_timezone(body: TimezoneResolveRequest):
+    dt = datetime(
+        year=body.year,
+        month=body.month,
+        day=body.day,
+        hour=body.hour,
+        minute=body.minute,
+        second=body.second,
+    )
     resolved_offset = _tz_offset_for(
-        body.datetime_local, body.timezone, fallback_minutes=None, strict=body.strict_birth
+        dt, body.timezone, fallback_minutes=None, strict=body.strict_birth
     )
     return {"tz_offset_minutes": resolved_offset}
 
+@app.post("/v1/diagnostics/ephemeris-check")
+async def ephemeris_check(body: EphemerisCheckRequest, request: Request, auth=Depends(get_auth)):
+    tz_offset_minutes = _tz_offset_for(body.datetime_local, body.timezone, fallback_minutes=None)
+    utc_dt = body.datetime_local - timedelta(minutes=tz_offset_minutes)
+    jd_ut = to_julian_day(utc_dt)
+
+    chart = compute_chart(
+        year=body.datetime_local.year,
+        month=body.datetime_local.month,
+        day=body.datetime_local.day,
+        hour=body.datetime_local.hour,
+        minute=body.datetime_local.minute,
+        second=body.datetime_local.second,
+        lat=body.lat,
+        lng=body.lng,
+        tz_offset_minutes=tz_offset_minutes,
+        house_system="P",
+        zodiac_type="tropical",
+        ayanamsa=None,
+    )
+
+    items = []
+    for name, planet_id in PLANETS.items():
+        result, _ = swe.calc_ut(jd_ut, planet_id)
+        ref_lon = result[0] % 360.0
+        chart_lon = float(chart["planets"][name]["lon"])
+        delta = angle_diff(chart_lon, ref_lon)
+        items.append(
+            {
+                "planet": name,
+                "chart_lon": round(chart_lon, 6),
+                "ref_lon": round(ref_lon, 6),
+                "delta_deg_abs": round(delta, 6),
+            }
+        )
+
+    return {
+        "utc_datetime": utc_dt.isoformat(),
+        "tz_offset_minutes": tz_offset_minutes,
+        "items": items,
+    }
+
+@app.post("/v1/insights/mercury-retrograde")
+async def mercury_retrograde(
+    body: MercuryRetrogradeRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
+    y, m, d = _parse_date_yyyy_mm_dd(body.target_date)
+    tz_offset_minutes = _tz_offset_for(
+        datetime(year=y, month=m, day=d, hour=12, minute=0, second=0),
+        body.timezone,
+        body.tz_offset_minutes,
+    )
+
+    transit_chart = compute_transits(
+        target_year=y,
+        target_month=m,
+        target_day=d,
+        lat=body.lat,
+        lng=body.lng,
+        tz_offset_minutes=tz_offset_minutes,
+        zodiac_type=body.zodiac_type.value,
+        ayanamsa=body.ayanamsa,
+    )
+
+    mercury = transit_chart["planets"]["Mercury"]
+    retrograde = bool(mercury.get("retrograde"))
+    speed = mercury.get("speed")
+
+    return {
+        "date": body.target_date,
+        "status": "retrograde" if retrograde else "direct",
+        "retrograde": retrograde,
+        "speed": speed,
+        "planet": "Mercury",
+        "note": "Baseado na velocidade aparente da efeméride no horário local de referência.",
+    }
+
+@app.post("/v1/insights/dominant-theme")
+async def dominant_theme(
+    body: TransitsRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
+    natal_dt = datetime(
+        year=body.natal_year,
+        month=body.natal_month,
+        day=body.natal_day,
+        hour=body.natal_hour,
+        minute=body.natal_minute,
+        second=body.natal_second,
+    )
+    tz_offset_minutes = _tz_offset_for(natal_dt, body.timezone, body.tz_offset_minutes)
+    context = _build_transits_context(body, tz_offset_minutes)
+    aspects = context["aspects"]
+
+    influence_counts: Dict[str, int] = {}
+    for asp in aspects:
+        influence = asp.get("influence", "neutral")
+        influence_counts[influence] = influence_counts.get(influence, 0) + 1
+
+    if not influence_counts:
+        return {
+            "theme": "Quiet influence",
+            "summary": "Poucos aspectos relevantes no período.",
+            "counts": {},
+            "sample_aspects": [],
+        }
+
+    dominant_influence = max(influence_counts.items(), key=lambda item: item[1])[0]
+    sample_aspects = aspects[:3]
+    summary_map = {
+        "intense": "Foco em intensidade e viradas rápidas.",
+        "challenging": "Período de desafios e ajustes conscientes.",
+        "supportive": "Fluxo mais leve e oportunidades de integração.",
+    }
+
+    return {
+        "theme": dominant_influence,
+        "summary": summary_map.get(dominant_influence, "Influência predominante do período."),
+        "counts": influence_counts,
+        "sample_aspects": sample_aspects,
+    }
+
+@app.post("/v1/insights/areas-activated")
+async def areas_activated(
+    body: TransitsRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
+    natal_dt = datetime(
+        year=body.natal_year,
+        month=body.natal_month,
+        day=body.natal_day,
+        hour=body.natal_hour,
+        minute=body.natal_minute,
+        second=body.natal_second,
+    )
+    tz_offset_minutes = _tz_offset_for(natal_dt, body.timezone, body.tz_offset_minutes)
+    context = _build_transits_context(body, tz_offset_minutes)
+    aspects = context["aspects"]
+
+    area_map = {
+        "Sun": "Identidade e propósito",
+        "Moon": "Emoções e segurança",
+        "Mercury": "Comunicação e estudos",
+        "Venus": "Relacionamentos e afeto",
+        "Mars": "Ação e energia",
+        "Jupiter": "Expansão e visão",
+        "Saturn": "Estrutura e responsabilidade",
+        "Uranus": "Mudanças e liberdade",
+        "Neptune": "Inspiração e sensibilidade",
+        "Pluto": "Transformação e poder pessoal",
+    }
+
+    influence_weight = {
+        "intense": 3,
+        "challenging": 2,
+        "supportive": 1,
+    }
+
+    scores: Dict[str, Dict[str, Any]] = {}
+    for asp in aspects:
+        planet = asp.get("natal_planet")
+        area = area_map.get(planet, "Tema geral")
+        weight = influence_weight.get(asp.get("influence"), 1)
+        scores.setdefault(area, {"area": area, "score": 0, "aspects": []})
+        scores[area]["score"] += weight
+        if len(scores[area]["aspects"]) < 3:
+            scores[area]["aspects"].append(asp)
+
+    items = sorted(scores.values(), key=lambda item: item["score"], reverse=True)
+    return {"items": items[:5]}
+
+@app.post("/v1/insights/care-suggestion")
+async def care_suggestion(
+    body: TransitsRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
+    natal_dt = datetime(
+        year=body.natal_year,
+        month=body.natal_month,
+        day=body.natal_day,
+        hour=body.natal_hour,
+        minute=body.natal_minute,
+        second=body.natal_second,
+    )
+    tz_offset_minutes = _tz_offset_for(natal_dt, body.timezone, body.tz_offset_minutes)
+    context = _build_transits_context(body, tz_offset_minutes)
+    aspects = context["aspects"]
+
+    moon = compute_moon_only(body.target_date, tz_offset_minutes=tz_offset_minutes)
+    phase = _moon_phase_4(moon["phase_angle_deg"])
+    sign = moon["moon_sign"]
+    dominant_influence = "neutral"
+    if aspects:
+        dominant_influence = max(
+            (asp.get("influence", "neutral") for asp in aspects),
+            key=lambda influence: sum(1 for asp in aspects if asp.get("influence") == influence),
+        )
+
+    suggestion_map = {
+        "intense": "Priorize pausas e escolhas conscientes para evitar impulsos.",
+        "challenging": "Organize tarefas e busque apoio antes de decisões grandes.",
+        "supportive": "Aproveite a fluidez para avançar em projetos criativos.",
+        "neutral": "Mantenha constância e foque em rotinas simples.",
+    }
+
+    return {
+        "moon_phase": phase,
+        "moon_sign": sign,
+        "theme": dominant_influence,
+        "suggestion": suggestion_map.get(dominant_influence, "Mantenha o equilíbrio e a presença."),
+    }
+
+@app.post("/v1/insights/life-cycles")
+async def life_cycles(
+    body: TransitsRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
+    target_y, target_m, target_d = _parse_date_yyyy_mm_dd(body.target_date)
+    birth = datetime(
+        year=body.natal_year,
+        month=body.natal_month,
+        day=body.natal_day,
+        hour=body.natal_hour,
+        minute=body.natal_minute,
+        second=body.natal_second,
+    )
+    target = datetime(target_y, target_m, target_d)
+    age_years = (target - birth).days / 365.25
+
+    cycles = [
+        {"name": "Retorno de Saturno", "cycle_years": 29.5},
+        {"name": "Retorno de Júpiter", "cycle_years": 11.86},
+        {"name": "Retorno de Nodos Lunares", "cycle_years": 18.6},
+    ]
+
+    items = []
+    for cycle in cycles:
+        cycle_years = cycle["cycle_years"]
+        nearest = round(age_years / cycle_years) * cycle_years
+        delta = age_years - nearest
+        items.append(
+            {
+                "cycle": cycle["name"],
+                "approx_age_years": round(nearest, 2),
+                "distance_years": round(delta, 2),
+                "status": "active" if abs(delta) < 0.5 else "out_of_window",
+            }
+        )
+
+    return {"age_years": round(age_years, 2), "items": items}
+
 @app.post("/v1/chart/natal")
-async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth)):
+async def natal(
+    body: NatalChartRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
     try:
         dt = datetime(
-            year=body.year,
-            month=body.month,
-            day=body.day,
-            hour=body.hour,
-            minute=body.minute,
-            second=body.second,
+            year=body.natal_year,
+            month=body.natal_month,
+            day=body.natal_day,
+            hour=body.natal_hour,
+            minute=body.natal_minute,
+            second=body.natal_second,
         )
         tz_offset_minutes = _tz_offset_for(
             dt, body.timezone, body.tz_offset_minutes, strict=body.strict_timezone
@@ -579,12 +1083,12 @@ async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth
             return cached
 
         chart = compute_chart(
-            year=body.year,
-            month=body.month,
-            day=body.day,
-            hour=body.hour,
-            minute=body.minute,
-            second=body.second,
+            year=body.natal_year,
+            month=body.natal_month,
+            day=body.natal_day,
+            hour=body.natal_hour,
+            minute=body.natal_minute,
+            second=body.natal_second,
             lat=body.lat,
             lng=body.lng,
             tz_offset_minutes=tz_offset_minutes,
@@ -604,7 +1108,11 @@ async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth
         raise HTTPException(status_code=500, detail=f"Erro ao calcular mapa natal: {str(e)}")
 
 @app.post("/v1/chart/transits")
-async def transits(body: TransitsRequest, request: Request, auth=Depends(get_auth)):
+async def transits(
+    body: TransitsRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
     y, m, d = _parse_date_yyyy_mm_dd(body.target_date)
 
     try:
@@ -633,7 +1141,7 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
             lat=body.lat,
             lng=body.lng,
             tz_offset_minutes=tz_offset_minutes,
-            house_system="P",
+            house_system=body.house_system.value,
             zodiac_type=body.zodiac_type.value,
             ayanamsa=body.ayanamsa,
         )
@@ -657,18 +1165,21 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
         moon = compute_moon_only(body.target_date, tz_offset_minutes=tz_offset_minutes)
         phase = _moon_phase_4(moon["phase_angle_deg"])
         sign = moon["moon_sign"]
+        phase_label = _moon_phase_label_pt(phase)
+        cosmic_weather = {
+            "moon_phase": phase,
+            "moon_sign": sign,
+            "headline": f"Lua {phase_label} em {sign}",
+            "text": _cw_text(phase, sign),
+        }
 
         response = {
             "date": body.target_date,
-            "cosmic_weather": {
-                "moon_phase": phase,
-                "moon_sign": sign,
-                "headline": f"Lua {phase} em {sign}",
-                "text": _cw_text(phase, sign),
-            },
+            "cosmic_weather": cosmic_weather,
             "natal": natal_chart,
             "transits": transit_chart,
             "aspects": aspects,
+            "areas_activated": _areas_activated(aspects, phase),
         }
 
         cache.set(cache_key, response, ttl_seconds=TTL_TRANSITS_SECONDS)
@@ -732,7 +1243,11 @@ async def cosmic_weather_range(
     return CosmicWeatherRangeResponse(from_=from_, to=to, items=items)
 
 @app.post("/v1/chart/render-data")
-async def render_data(body: RenderDataRequest, request: Request, auth=Depends(get_auth)):
+async def render_data(
+    body: RenderDataRequest,
+    request: Request,
+    auth=Depends(get_auth),
+):
     dt = datetime(
         year=body.year,
         month=body.month,
@@ -786,7 +1301,7 @@ async def render_data(body: RenderDataRequest, request: Request, auth=Depends(ge
         })
 
     resp = {
-        "zodiac": ["Áries","Touro","Gêmeos","Câncer","Leão","Virgem","Libra","Escorpião","Sagitário","Capricórnio","Aquário","Peixes"],
+        "zodiac": ZODIAC_SIGNS,
         "houses": houses,
         "planets": planets,
         "premium_aspects": [] if is_trial_or_premium(auth["plan"]) else None,
@@ -863,6 +1378,31 @@ async def system_alerts(
         alerts.append(mercury)
 
     return SystemAlertsResponse(date=date, alerts=alerts)
+
+
+@app.get("/v1/alerts/retrogrades")
+async def retrogrades_alerts(
+    date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    timezone: Optional[str] = Query(None, description="Timezone IANA"),
+    tz_offset_minutes: Optional[int] = Query(None, ge=-840, le=840),
+):
+    if date:
+        y, m, d = _parse_date_yyyy_mm_dd(date)
+        local_dt = datetime(year=y, month=m, day=d, hour=12, minute=0, second=0)
+    else:
+        if timezone:
+            try:
+                tzinfo = ZoneInfo(timezone)
+            except ZoneInfoNotFoundError:
+                raise HTTPException(status_code=400, detail=f"Timezone inválido: {timezone}")
+            local_dt = datetime.now(tzinfo).replace(hour=12, minute=0, second=0, microsecond=0)
+        else:
+            local_dt = datetime.utcnow().replace(hour=12, minute=0, second=0, microsecond=0)
+
+    resolved_offset = _tz_offset_for(local_dt, timezone, tz_offset_minutes)
+    utc_dt = local_dt - timedelta(minutes=resolved_offset)
+    alerts = retrograde_alerts(utc_dt)
+    return {"retrogrades": alerts}
 
 
 @app.get("/v1/notifications/daily", response_model=NotificationsDailyResponse)
