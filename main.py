@@ -318,6 +318,12 @@ class TransitsRequest(BaseModel):
         validation_alias=AliasChoices("natal_second", "second"),
         description="Segundo de nascimento (aceita alias second).",
     )
+    natal_year: int = Field(..., ge=1800, le=2100, validation_alias=AliasChoices("natal_year", "year"))
+    natal_month: int = Field(..., ge=1, le=12, validation_alias=AliasChoices("natal_month", "month"))
+    natal_day: int = Field(..., ge=1, le=31, validation_alias=AliasChoices("natal_day", "day"))
+    natal_hour: int = Field(..., ge=0, le=23, validation_alias=AliasChoices("natal_hour", "hour"))
+    natal_minute: int = Field(0, ge=0, le=59, validation_alias=AliasChoices("natal_minute", "minute"))
+    natal_second: int = Field(0, ge=0, le=59, validation_alias=AliasChoices("natal_second", "second"))
     lat: float = Field(..., ge=-89.9999, le=89.9999)
     lng: float = Field(..., ge=-180, le=180)
     tz_offset_minutes: Optional[int] = Field(
@@ -473,6 +479,12 @@ class MercuryRetrogradeRequest(BaseModel):
                 detail="Informe timezone IANA ou tz_offset_minutes para calcular retrogradação.",
             )
         return self
+class EphemerisCheckRequest(BaseModel):
+    datetime_local: datetime = Field(..., description="Data/hora local, ex.: 2024-01-01T12:00:00")
+    timezone: str = Field(..., description="Timezone IANA, ex.: Etc/UTC")
+    lat: float = Field(..., ge=-89.9999, le=89.9999)
+    lng: float = Field(..., ge=-180, le=180)
+
 
 class SystemAlert(BaseModel):
     id: str

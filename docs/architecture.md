@@ -107,6 +107,7 @@ await fetch(`${API_URL}/v1/chart/natal`, {
 
 ### 5.2 Fluxo típico no front-end
 1. **Resolver timezone** (opcional): `POST /v1/time/resolve-tz` (aceita `year/month/day/...` e também `datetime_local` legado).
+1. **Resolver timezone** (opcional): `POST /v1/time/resolve-tz`.
 2. **Mapa natal**: `POST /v1/chart/natal`.
 3. **Renderização visual**: `POST /v1/chart/render-data` (gera casas/planetas em formato fácil para UI).
 4. **Trânsitos**: `POST /v1/chart/transits` para períodos alvo.
