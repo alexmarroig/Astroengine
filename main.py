@@ -14,13 +14,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator, AliasChoices
+from fastapi.exceptions import RequestValidationError
 from openai import OpenAI
 import swisseph as swe
 
 from astro.ephemeris import PLANETS, compute_chart, compute_transits, compute_moon_only
 from astro.aspects import compute_transit_aspects
-from astro.utils import angle_diff, to_julian_day
+from astro.utils import angle_diff, to_julian_day, sign_to_pt, ZODIAC_SIGNS, ZODIAC_SIGNS_PT
 from ai.prompts import build_cosmic_chat_messages
 
 from core.security import require_api_key_and_user
@@ -125,7 +126,12 @@ async def request_logging_middleware(request: Request, call_next):
         logger.error("unhandled_exception", exc_info=True, extra=extra)
         return JSONResponse(
             status_code=500,
-            content={"detail": "Erro interno no servidor.", "request_id": request_id},
+            content={
+                "detail": "Erro interno no servidor.",
+                "request_id": request_id,
+                "code": "internal_error",
+            },
+            headers={"X-Request-Id": request_id},
         )
 
 # -----------------------------
@@ -133,7 +139,7 @@ async def request_logging_middleware(request: Request, call_next):
 # -----------------------------
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    request_id = getattr(request.state, "request_id", None)
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
     extra = {
         "request_id": request_id,
         "path": request.url.path,
@@ -141,10 +147,33 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         "latency_ms": None,
     }
     _log("warning", "http_exception", **extra)
-    payload = {"detail": exc.detail}
-    if request_id:
-        payload["request_id"] = request_id
-    return JSONResponse(status_code=exc.status_code, content=payload)
+    payload = {
+        "detail": exc.detail,
+        "request_id": request_id,
+        "code": f"http_{exc.status_code}",
+    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=payload,
+        headers={"X-Request-Id": request_id},
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+    extra = {
+        "request_id": request_id,
+        "path": request.url.path,
+        "status": 422,
+        "latency_ms": None,
+    }
+    _log("warning", "validation_error", **extra)
+    payload = {
+        "detail": exc.errors(),
+        "request_id": request_id,
+        "code": "validation_error",
+    }
+    return JSONResponse(status_code=422, content=payload, headers={"X-Request-Id": request_id})
 
 # -----------------------------
 # Auth dependency
@@ -176,12 +205,12 @@ class ZodiacType(str, Enum):
 
 
 class NatalChartRequest(BaseModel):
-    year: int = Field(..., ge=1800, le=2100)
-    month: int = Field(..., ge=1, le=12)
-    day: int = Field(..., ge=1, le=31)
-    hour: int = Field(..., ge=0, le=23)
-    minute: int = Field(0, ge=0, le=59)
-    second: int = Field(0, ge=0, le=59)
+    year: int = Field(..., ge=1800, le=2100, validation_alias=AliasChoices("year", "natal_year"))
+    month: int = Field(..., ge=1, le=12, validation_alias=AliasChoices("month", "natal_month"))
+    day: int = Field(..., ge=1, le=31, validation_alias=AliasChoices("day", "natal_day"))
+    hour: int = Field(..., ge=0, le=23, validation_alias=AliasChoices("hour", "natal_hour"))
+    minute: int = Field(0, ge=0, le=59, validation_alias=AliasChoices("minute", "natal_minute"))
+    second: int = Field(0, ge=0, le=59, validation_alias=AliasChoices("second", "natal_second"))
     lat: float = Field(..., ge=-89.9999, le=89.9999)
     lng: float = Field(..., ge=-180, le=180)
     tz_offset_minutes: Optional[int] = Field(
@@ -211,12 +240,12 @@ class NatalChartRequest(BaseModel):
         return self
 
 class TransitsRequest(BaseModel):
-    natal_year: int = Field(..., ge=1800, le=2100)
-    natal_month: int = Field(..., ge=1, le=12)
-    natal_day: int = Field(..., ge=1, le=31)
-    natal_hour: int = Field(..., ge=0, le=23)
-    natal_minute: int = Field(0, ge=0, le=59)
-    natal_second: int = Field(0, ge=0, le=59)
+    natal_year: int = Field(..., ge=1800, le=2100, validation_alias=AliasChoices("natal_year", "year"))
+    natal_month: int = Field(..., ge=1, le=12, validation_alias=AliasChoices("natal_month", "month"))
+    natal_day: int = Field(..., ge=1, le=31, validation_alias=AliasChoices("natal_day", "day"))
+    natal_hour: int = Field(..., ge=0, le=23, validation_alias=AliasChoices("natal_hour", "hour"))
+    natal_minute: int = Field(0, ge=0, le=59, validation_alias=AliasChoices("natal_minute", "minute"))
+    natal_second: int = Field(0, ge=0, le=59, validation_alias=AliasChoices("natal_second", "second"))
     lat: float = Field(..., ge=-89.9999, le=89.9999)
     lng: float = Field(..., ge=-180, le=180)
     tz_offset_minutes: Optional[int] = Field(
@@ -256,6 +285,7 @@ class CosmicWeatherResponse(BaseModel):
     date: str
     moon_phase: str
     moon_sign: str
+    moon_sign_pt: Optional[str] = None
     headline: str
     text: str
 
@@ -304,12 +334,47 @@ class RenderDataRequest(BaseModel):
 
 
 class TimezoneResolveRequest(BaseModel):
-    datetime_local: datetime = Field(..., description="Data/hora local, ex.: 2025-12-19T14:30:00")
+    datetime_local: Optional[datetime] = Field(
+        None, description="Compatibilidade: data/hora local ISO (ex.: 2025-12-19T14:30:00)"
+    )
+    year: int = Field(..., ge=1800, le=2100)
+    month: int = Field(..., ge=1, le=12)
+    day: int = Field(..., ge=1, le=31)
+    hour: int = Field(..., ge=0, le=23)
+    minute: int = Field(0, ge=0, le=59)
+    second: int = Field(0, ge=0, le=59)
     timezone: str = Field(..., description="Timezone IANA, ex.: America/Sao_Paulo")
     strict_birth: bool = Field(
         default=False,
         description="Quando true, acusa horários ambíguos em transições de DST para dados de nascimento.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_datetime_local(cls, data: Any):
+        if not isinstance(data, dict):
+            return data
+        if data.get("datetime_local") and not all(
+            key in data for key in ("year", "month", "day", "hour")
+        ):
+            dt = data["datetime_local"]
+            if isinstance(dt, str):
+                dt = datetime.fromisoformat(dt)
+            data = {**data}
+            data.setdefault("year", dt.year)
+            data.setdefault("month", dt.month)
+            data.setdefault("day", dt.day)
+            data.setdefault("hour", dt.hour)
+            data.setdefault("minute", dt.minute)
+            data.setdefault("second", dt.second)
+        return data
+
+
+class EphemerisCheckRequest(BaseModel):
+    datetime_local: datetime = Field(..., description="Data/hora local, ex.: 2024-01-01T12:00:00")
+    timezone: str = Field(..., description="Timezone IANA, ex.: Etc/UTC")
+    lat: float = Field(..., ge=-89.9999, le=89.9999)
+    lng: float = Field(..., ge=-180, le=180)
 
 
 class EphemerisCheckRequest(BaseModel):
@@ -363,6 +428,32 @@ def _cw_text(phase: str, sign: str) -> str:
         "A energia pode ficar mais intensa em alguns momentos. Pausas curtas e ritmo consistente ajudam.",
     ]
     return options[hash(phase + sign) % len(options)]
+
+def _is_pt_br(lang: Optional[str]) -> bool:
+    return (lang or "").lower().replace("_", "-") == "pt-br"
+
+def _apply_sign_localization(chart: Dict[str, Any], lang: Optional[str]) -> Dict[str, Any]:
+    planets = chart.get("planets", {})
+    for planet in planets.values():
+        sign = planet.get("sign")
+        if not sign:
+            continue
+        sign_pt = sign_to_pt(sign)
+        planet["sign_pt"] = sign_pt
+        if _is_pt_br(lang):
+            planet["sign"] = sign_pt
+    return chart
+
+def _apply_moon_localization(payload: Dict[str, Any], lang: Optional[str]) -> Dict[str, Any]:
+    sign = payload.get("moon_sign")
+    if sign:
+        sign_pt = sign_to_pt(sign)
+        payload["moon_sign_pt"] = sign_pt
+        if _is_pt_br(lang):
+            payload["moon_sign"] = sign_pt
+            if "headline" in payload:
+                payload["headline"] = payload["headline"].replace(sign, sign_pt)
+    return payload
 
 def _now_yyyy_mm_dd() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
@@ -496,7 +587,11 @@ TTL_COSMIC_WEATHER_SECONDS = 6 * 3600
 
 
 def _cosmic_weather_payload(
-    date_str: str, timezone: Optional[str], tz_offset_minutes: Optional[int], user_id: str
+    date_str: str,
+    timezone: Optional[str],
+    tz_offset_minutes: Optional[int],
+    user_id: str,
+    lang: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute (or fetch) the cosmic weather payload for a single day."""
 
@@ -504,7 +599,8 @@ def _cosmic_weather_payload(
     dt = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=12, minute=0, second=0)
     resolved_offset = _tz_offset_for(dt, timezone, tz_offset_minutes)
 
-    cache_key = f"cw:{user_id}:{date_str}:{timezone}:{resolved_offset}"
+    lang_key = (lang or "").lower()
+    cache_key = f"cw:{user_id}:{date_str}:{timezone}:{resolved_offset}:{lang_key}"
     cached = cache.get(cache_key)
     if cached:
         return cached
@@ -520,6 +616,8 @@ def _cosmic_weather_payload(
         "headline": f"Lua {phase} em {sign}",
         "text": _cw_text(phase, sign),
     }
+
+    payload = _apply_moon_localization(payload, lang)
 
     cache.set(cache_key, payload, ttl_seconds=TTL_COSMIC_WEATHER_SECONDS)
     return payload
@@ -563,8 +661,16 @@ async def roadmap():
 
 @app.post("/v1/time/resolve-tz")
 async def resolve_timezone(body: TimezoneResolveRequest):
+    dt = datetime(
+        year=body.year,
+        month=body.month,
+        day=body.day,
+        hour=body.hour,
+        minute=body.minute,
+        second=body.second,
+    )
     resolved_offset = _tz_offset_for(
-        body.datetime_local, body.timezone, fallback_minutes=None, strict=body.strict_birth
+        dt, body.timezone, fallback_minutes=None, strict=body.strict_birth
     )
     return {"tz_offset_minutes": resolved_offset}
 
@@ -611,7 +717,12 @@ async def ephemeris_check(body: EphemerisCheckRequest, request: Request, auth=De
     }
 
 @app.post("/v1/chart/natal")
-async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth)):
+async def natal(
+    body: NatalChartRequest,
+    request: Request,
+    lang: Optional[str] = Query(None, description="Idioma para nomes de signos (ex.: pt-BR)"),
+    auth=Depends(get_auth),
+):
     try:
         dt = datetime(
             year=body.year,
@@ -625,7 +736,8 @@ async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth
             dt, body.timezone, body.tz_offset_minutes, strict=body.strict_timezone
         )
 
-        cache_key = f"natal:{auth['user_id']}:{hash(body.model_dump_json())}"
+        lang_key = (lang or "").lower()
+        cache_key = f"natal:{auth['user_id']}:{hash(body.model_dump_json())}:{lang_key}"
         cached = cache.get(cache_key)
         if cached:
             return cached
@@ -645,6 +757,8 @@ async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth
             ayanamsa=body.ayanamsa,
         )
 
+        chart = _apply_sign_localization(chart, lang)
+
         cache.set(cache_key, chart, ttl_seconds=TTL_NATAL_SECONDS)
         return chart
     except Exception as e:
@@ -656,7 +770,12 @@ async def natal(body: NatalChartRequest, request: Request, auth=Depends(get_auth
         raise HTTPException(status_code=500, detail=f"Erro ao calcular mapa natal: {str(e)}")
 
 @app.post("/v1/chart/transits")
-async def transits(body: TransitsRequest, request: Request, auth=Depends(get_auth)):
+async def transits(
+    body: TransitsRequest,
+    request: Request,
+    lang: Optional[str] = Query(None, description="Idioma para nomes de signos (ex.: pt-BR)"),
+    auth=Depends(get_auth),
+):
     y, m, d = _parse_date_yyyy_mm_dd(body.target_date)
 
     try:
@@ -670,7 +789,8 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
         )
         tz_offset_minutes = _tz_offset_for(natal_dt, body.timezone, body.tz_offset_minutes)
 
-        cache_key = f"transits:{auth['user_id']}:{body.target_date}"
+        lang_key = (lang or "").lower()
+        cache_key = f"transits:{auth['user_id']}:{body.target_date}:{lang_key}"
         cached = cache.get(cache_key)
         if cached:
             return cached
@@ -701,6 +821,9 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
             ayanamsa=body.ayanamsa,
         )
 
+        natal_chart = _apply_sign_localization(natal_chart, lang)
+        transit_chart = _apply_sign_localization(transit_chart, lang)
+
         aspects = compute_transit_aspects(
             transit_planets=transit_chart["planets"],
             natal_planets=natal_chart["planets"],
@@ -709,15 +832,18 @@ async def transits(body: TransitsRequest, request: Request, auth=Depends(get_aut
         moon = compute_moon_only(body.target_date, tz_offset_minutes=tz_offset_minutes)
         phase = _moon_phase_4(moon["phase_angle_deg"])
         sign = moon["moon_sign"]
+        cosmic_weather = {
+            "moon_phase": phase,
+            "moon_sign": sign,
+            "headline": f"Lua {phase} em {sign}",
+            "text": _cw_text(phase, sign),
+        }
+        cosmic_weather = _apply_moon_localization(cosmic_weather, lang)
+        cosmic_weather["headline"] = f"Lua {phase} em {cosmic_weather['moon_sign']}"
 
         response = {
             "date": body.target_date,
-            "cosmic_weather": {
-                "moon_phase": phase,
-                "moon_sign": sign,
-                "headline": f"Lua {phase} em {sign}",
-                "text": _cw_text(phase, sign),
-            },
+            "cosmic_weather": cosmic_weather,
             "natal": natal_chart,
             "transits": transit_chart,
             "aspects": aspects,
@@ -742,10 +868,11 @@ async def cosmic_weather(
     tz_offset_minutes: Optional[int] = Query(
         None, ge=-840, le=840, description="Offset manual em minutos; ignorado se timezone for enviado."
     ),
+    lang: Optional[str] = Query(None, description="Idioma para nomes de signos (ex.: pt-BR)"),
     auth=Depends(get_auth),
 ):
     d = date or _now_yyyy_mm_dd()
-    payload = _cosmic_weather_payload(d, timezone, tz_offset_minutes, auth["user_id"])
+    payload = _cosmic_weather_payload(d, timezone, tz_offset_minutes, auth["user_id"], lang)
     return CosmicWeatherResponse(**payload)
 
 
@@ -758,6 +885,7 @@ async def cosmic_weather_range(
     tz_offset_minutes: Optional[int] = Query(
         None, ge=-840, le=840, description="Offset manual em minutos; ignorado se timezone for enviado."
     ),
+    lang: Optional[str] = Query(None, description="Idioma para nomes de signos (ex.: pt-BR)"),
     auth=Depends(get_auth),
 ):
     start_y, start_m, start_d = _parse_date_yyyy_mm_dd(from_)
@@ -777,14 +905,19 @@ async def cosmic_weather_range(
     current = start_date
     for _ in range(interval_days):
         date_str = current.strftime("%Y-%m-%d")
-        payload = _cosmic_weather_payload(date_str, timezone, tz_offset_minutes, auth["user_id"])
+        payload = _cosmic_weather_payload(date_str, timezone, tz_offset_minutes, auth["user_id"], lang)
         items.append(CosmicWeatherResponse(**payload))
         current += timedelta(days=1)
 
     return CosmicWeatherRangeResponse(from_=from_, to=to, items=items)
 
 @app.post("/v1/chart/render-data")
-async def render_data(body: RenderDataRequest, request: Request, auth=Depends(get_auth)):
+async def render_data(
+    body: RenderDataRequest,
+    request: Request,
+    lang: Optional[str] = Query(None, description="Idioma para nomes de signos (ex.: pt-BR)"),
+    auth=Depends(get_auth),
+):
     dt = datetime(
         year=body.year,
         month=body.month,
@@ -795,7 +928,8 @@ async def render_data(body: RenderDataRequest, request: Request, auth=Depends(ge
     )
     tz_offset_minutes = _tz_offset_for(dt, body.timezone, body.tz_offset_minutes)
 
-    cache_key = f"render:{auth['user_id']}:{hash(body.model_dump_json())}"
+    lang_key = (lang or "").lower()
+    cache_key = f"render:{auth['user_id']}:{hash(body.model_dump_json())}:{lang_key}"
     cached = cache.get(cache_key)
     if cached:
         return cached
@@ -814,6 +948,7 @@ async def render_data(body: RenderDataRequest, request: Request, auth=Depends(ge
         zodiac_type=body.zodiac_type.value,
         ayanamsa=body.ayanamsa,
     )
+    natal = _apply_sign_localization(natal, lang)
 
     cusps = natal.get("houses", {}).get("cusps")
     if not cusps or len(cusps) < 12:
@@ -833,12 +968,15 @@ async def render_data(body: RenderDataRequest, request: Request, auth=Depends(ge
         planets.append({
             "name": name,
             "sign": p.get("sign"),
+            "sign_pt": p.get("sign_pt"),
             "deg_in_sign": p.get("deg_in_sign"),
             "angle_deg": p.get("lon"),
         })
 
+    zodiac = ZODIAC_SIGNS_PT if _is_pt_br(lang) else ZODIAC_SIGNS
+
     resp = {
-        "zodiac": ["Áries","Touro","Gêmeos","Câncer","Leão","Virgem","Libra","Escorpião","Sagitário","Capricórnio","Aquário","Peixes"],
+        "zodiac": zodiac,
         "houses": houses,
         "planets": planets,
         "premium_aspects": [] if is_trial_or_premium(auth["plan"]) else None,

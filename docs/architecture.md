@@ -109,6 +109,7 @@ await fetch(`${API_URL}/v1/chart/natal`, {
 ### 5.3 Boas práticas no front-end
 - Cachear respostas do backend quando possível (principalmente mapas). 
 - Usar `house_system`, `zodiac_type` e `ayanamsa` conforme configurações do usuário.
+- Quando precisar de nomes dos signos em PT-BR, use `?lang=pt-BR`. Respostas incluem `sign_pt` e `moon_sign_pt`.
 - Tratar erros 400 (timezone inválido) e 500 (cálculo falhou) exibindo mensagens amigáveis.
 - Para UX, considerar loading states para chamadas com cálculo astrológico.
 
@@ -116,6 +117,8 @@ await fetch(`${API_URL}/v1/chart/natal`, {
 - `HouseSystem` (main.py) controla códigos de sistema de casas.
 - `ZodiacType` define `tropical` ou `sidereal`.
 - `NatalChartRequest`, `TransitsRequest`, `RenderDataRequest` definem payloads principais.
+  - `NatalChartRequest` aceita `year/month/...` e também aliases `natal_year/natal_month/...`.
+  - `TransitsRequest` aceita `natal_year/natal_month/...` e também aliases `year/month/...` para compatibilidade.
 
 ## 7. Configuração e variáveis de ambiente
 - `OPENAI_API_KEY`: obrigatório para `/v1/ai/cosmic-chat`.
@@ -143,4 +146,3 @@ await fetch(`${API_URL}/v1/chart/natal`, {
 - [ ] Usar payloads válidos (timezone ou tz_offset).
 - [ ] Tratar códigos de erro.
 - [ ] Mapear respostas em componentes visuais.
-

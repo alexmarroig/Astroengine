@@ -6,6 +6,14 @@ ZODIAC_SIGNS = [
     "Sagittarius", "Capricorn", "Aquarius", "Pisces"
 ]
 
+ZODIAC_SIGNS_PT = [
+    "Áries", "Touro", "Gêmeos", "Câncer",
+    "Leão", "Virgem", "Libra", "Escorpião",
+    "Sagitário", "Capricórnio", "Aquário", "Peixes"
+]
+
+SIGN_PT = dict(zip(ZODIAC_SIGNS, ZODIAC_SIGNS_PT))
+
 
 def to_julian_day(dt: datetime) -> float:
     year = dt.year
@@ -31,6 +39,10 @@ def deg_to_sign(lon: float) -> dict:
         "sign": ZODIAC_SIGNS[sign_index],
         "deg_in_sign": round(deg_in_sign, 4)
     }
+
+
+def sign_to_pt(sign: str) -> str:
+    return SIGN_PT.get(sign, sign)
 
 
 def angle_diff(a: float, b: float) -> float:
